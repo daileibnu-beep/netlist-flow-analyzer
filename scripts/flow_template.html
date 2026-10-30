@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>模块连接汇总图</title>
+<style>
+:root{color-scheme:light dark;--bg:light-dark(#f5f7fa,#15191f);--panel:light-dark(#fff,#20262e);--fg:light-dark(#1e3044,#e3ebf4);--muted:light-dark(#536679,#b3c2d2);--line:light-dark(#c4cfd8,#5d6c7c);--accent:light-dark(#186897,#75c3ed)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 system-ui,"PingFang SC",sans-serif}main{max-width:1600px;margin:auto;padding:22px}h1{font-size:25px;margin:0}h2{font-size:19px}p{margin:8px 0}.note{color:var(--muted)}.panel{background:var(--panel);padding:18px;margin-top:18px;border-radius:8px}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}select{max-width:100%;padding:7px;background:var(--panel);color:var(--fg);border:1px solid var(--line);font:inherit}label{display:flex;gap:8px;align-items:center;max-width:100%}button{font:inherit;background:var(--panel);color:var(--accent);border:1px solid var(--line);border-radius:4px;padding:5px 12px;cursor:pointer}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:9px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}details{margin-top:14px}a{color:var(--accent)}.stats{font-variant-numeric:tabular-nums}#graph-viewport{height:72vh;min-height:360px;max-height:950px;margin-top:14px;background:#fff;border:1px solid var(--line);overflow:hidden;touch-action:none}#graph-document{width:100%;height:100%}#graph-document>svg{display:block;width:100%;height:100%}#graph-document .dim{opacity:.1}#graph-document .node,#graph-document .edge{cursor:pointer}#module-detail{min-height:50px}summary{cursor:pointer}#focus{width:min(70ch,100%)}
+</style></head><body><main>
+<h1>模块连接汇总图</h1><p id="scope"></p>
+<p id="summary" class="stats"></p>
+<p id="source-note" class="note"></p>
+<p id="metric-note" class="note">每对模块的同向连接合并为一条箭头；数字为端口位连接数，数量越大线越粗。双向关系分别统计。相同 net 的不同端点可能重复计数，不代表独立 net 数或带宽。</p>
+<div class="panel"><div class="controls"><button type="button" id="fit">全图</button><button type="button" id="zoom-in">放大</button><button type="button" id="zoom-out">缩小</button><label>定位模块 <select id="focus"><option value="">全部模块</option></select></label></div>
+<p class="note">图形与 flow.svg、flow.dot 对应；可拖动平移、滚轮缩放。点击模块查看相邻关系，点击粗细连线查看汇总与明细。</p>
+<div id="graph-viewport"><div id="graph-document">__MODULE_SVG__</div></div><p id="view-status" class="note" aria-live="polite"></p></div>
+<div class="panel"><h2>所选模块连接</h2><p id="module-detail">图中不展开具体信号线。点击一条模块连线查看其计数及按需明细。</p>
+<details id="port-details"><summary>端口对和逐位证据（按需加载）</summary><p class="note">明细与图形分开加载。若当前预览无法读取同目录文件，可选择本图的 flow.json；文件仅在本页读取。</p><label>选择完整明细 <input id="detail-file" type="file" accept=".json,application/json"></label><pre id="detail">选择一条模块连线后查看。</pre></details>
+<details id="module-edge-list"><summary>全部模块间连接数量</summary><div class="scroll"><table><thead><tr><th>源模块</th><th>目的模块</th><th>位连接数</th><th>端口对数量</th></tr></thead><tbody id="module-edges"></tbody></table></div></details></div>
+<div class="panel"><details><summary>分析范围与覆盖</summary><pre id="coverage"></pre><pre id="limitations" class="note"></pre></details><details><summary>展开的实例层次</summary><pre id="expanded"></pre></details><details><summary>未知边界、空接与常量统计</summary><pre id="diagnostics"></pre><p class="note">完整诊断和逐位数据保存在 flow.json。</p></details>
+<p>图形：<a href="flow.svg">SVG</a> · <a href="flow.dot">DOT</a>　数据：<a href="flow_modules.json">模块汇总</a> · <a href="flow.json">完整逐位数据</a></p></div>
+</main><script>
+'use strict';
+const DATA=__FLOW_DATA__;
+const MODULES=__MODULE_DATA__;
+const $=id=>document.getElementById(id);
+const diagram=$('graph-document').querySelector('svg');
+const nodeMap=new Map(MODULES.nodes.map(n=>[n.id,n]));
+const svgNodes=new Map(MODULES.nodes.map(n=>[n.id,document.getElementById(n.svg_id)]));
+const svgEdges=new Map(MODULES.edges.map(e=>[e.svg_id,document.getElementById(e.svg_id)]));
+const original=(diagram?.getAttribute('viewBox')||'0 0 1000 700').trim().split(/[ ,]+/).map(Number);
+let view=[...original],pan=null,dragged=false;
+let selectedEdge=null,detailData=null,detailsPromise=null;
+const fmt=n=>n.toLocaleString();
+$('scope').textContent=`顶层：${DATA.top}　分析根：${DATA.root}　根深度：${DATA.depth}`;
+if(DATA.selection.expand.length)$('scope').textContent+='　实例展开：'+DATA.selection.expand.map(x=>`${x.path}（depth=${x.depth}）`).join('；');
+const S=MODULES.summary;
+$('source-note').textContent=DATA.data_source?.summary||'来源：结构网表中的显式端口与支持的简单 assign。折叠模块不推断内部功能。';
+$('metric-note').textContent=`每对模块的同向连接合并为一条箭头；数字为${MODULES.unit}，数量越大线越粗。双向关系分别统计。相同 net 的不同端点可能重复计数，不代表独立 net 数或带宽。`;
+$('limitations').textContent=(DATA.limitations||['未做功能、时序或物理验证。']).join('\n');
+$('summary').textContent=`${fmt(S.nodes)} 个节点；${fmt(S.original_port_pair_edges)} 条端口对合并为 ${fmt(S.displayed_module_pair_edges)} 条模块连线；图中累计 ${fmt(S.displayed_bit_connections)} 个位连接。`;
+if(S.hidden_module_pair_edges)$('summary').textContent+=` 按最小数量 ${MODULES.minimum_connections} 隐藏了 ${fmt(S.hidden_module_pair_edges)} 条模块连线、${fmt(S.hidden_bit_connections)} 个位连接。`;
+$('coverage').textContent=JSON.stringify(DATA.coverage,null,2);
+$('expanded').textContent=DATA.expanded_scopes.map(n=>`${n.id}  [${n.module_type}]`).join('\n');
+if(DATA.expanded_scope_count>DATA.expanded_scopes.length)$('expanded').textContent+=`\n仅显示前 ${DATA.expanded_scopes.length} 项；全部 ${DATA.expanded_scope_count} 项见 flow.json。`;
+$('diagnostics').textContent=JSON.stringify(DATA.diagnostics_counts,null,2);
+function applyView(){if(diagram)diagram.setAttribute('viewBox',view.join(' '))}
+function zoom(factor){const w=view[2]*factor,h=view[3]*factor;if(w<8||w>original[2]*10)return;view=[view[0]+(view[2]-w)/2,view[1]+(view[3]-h)/2,w,h];applyView()}
+function reset(){view=[...original];applyView()}
+function graphBox(element){
+ try{
+  if(!diagram)return null;
+  const base=diagram.getScreenCTM(),target=element.getScreenCTM();
+  if(!base||!target||typeof DOMPoint==='undefined')return null;
+  const b=element.getBBox(),matrix=base.inverse().multiply(target);
+  const points=[[b.x,b.y],[b.x+b.width,b.y],[b.x,b.y+b.height],[b.x+b.width,b.y+b.height]].map(([x,y])=>new DOMPoint(x,y).matrixTransform(matrix));
+  const x=Math.min(...points.map(p=>p.x)),y=Math.min(...points.map(p=>p.y));
+  const box={x,y,width:Math.max(...points.map(p=>p.x))-x,height:Math.max(...points.map(p=>p.y))-y};
+  return Object.values(box).every(Number.isFinite)?box:null;
+ }catch{return null}
+}
+function selectNode(id){
+ const active=new Set(id?[id]:MODULES.nodes.map(n=>n.id));
+ if(id)for(const e of MODULES.edges)if(e.source===id||e.sink===id){active.add(e.source);active.add(e.sink)}
+ for(const [key,element]of svgNodes)if(element)element.classList.toggle('dim',!active.has(key));
+ for(const e of MODULES.edges){const element=svgEdges.get(e.svg_id);if(element)element.classList.toggle('dim',!!id&&e.source!==id&&e.sink!==id)}
+ $('focus').value=id;
+ $('view-status').textContent=id?`当前突出显示 ${id} 及其相邻模块；淡色关系仍保留在全图中。`:'全图：每条箭头表示一个方向的模块连接汇总。';
+ if(id){const boxes=[...active].map(n=>svgNodes.get(n)).filter(Boolean).map(graphBox).filter(Boolean);if(boxes.length){const x=Math.min(...boxes.map(b=>b.x))-50,y=Math.min(...boxes.map(b=>b.y))-50;view=[x,y,Math.max(...boxes.map(b=>b.x+b.width))-x+50,Math.max(...boxes.map(b=>b.y+b.height))-y+50];applyView()}}else reset();
+}
+function checkDetails(value){
+ if(!value||!Array.isArray(value.edges)||value.root!==DATA.root||value.top!==DATA.top)throw Error('明细与当前图不匹配');
+ if(value.fingerprint&&value.fingerprint!==DATA.details_fingerprint)throw Error('明细版本已变化，请重新打开本图');
+ return value;
+}
+function loadDetails(){
+ if(detailData)return Promise.resolve(detailData);
+ if(detailsPromise)return detailsPromise;
+ detailsPromise=new Promise((resolve,reject)=>{
+  const script=document.createElement('script');
+  const timer=setTimeout(()=>reject(Error('读取明细超时')),10000);
+  script.src=DATA.details_url;
+  script.onload=()=>{clearTimeout(timer);try{detailData=checkDetails(window.__FLOW_DETAILS__);resolve(detailData)}catch(error){reject(error)}};
+  script.onerror=()=>{clearTimeout(timer);reject(Error('当前预览无法读取同目录明细文件'))};
+  document.head.append(script);
+ }).catch(error=>{detailsPromise=null;throw error});
+ return detailsPromise;
+}
+function displayDetails(){
+ if(!selectedEdge||!detailData)return;
+ const edge=selectedEdge,details=detailData.edges.filter(e=>e.source===edge.source&&e.sink===edge.sink);
+ $('detail').textContent=details.map(e=>`${e.source_pin} → ${e.sink_pin}：${fmt(e.direct_bit_connections)} 位\n位映射：${e.bit_connections.map(p=>`${p.source_bit===null?'scalar':p.source_bit} → ${p.sink_bit===null?'scalar':p.sink_bit}`).join(', ')}\n路径证据：${JSON.stringify(e.examples,null,2)}`).join('\n\n');
+}
+async function requestDetails(){
+ if(!selectedEdge){$('detail').textContent='先选择一条模块连线。';return}
+ $('detail').textContent='正在读取所选连线的端口与逐位明细…';
+ try{await loadDetails();displayDetails()}catch(error){if(detailData){displayDetails();return}$('detail').textContent=error.message+'。图形和计数仍可使用；可通过上方按钮选择本图的 flow.json。'}
+}
+function showConnection(edge){
+ selectedEdge=edge;
+ $('module-detail').textContent=`${edge.source} → ${edge.sink}：${fmt(edge.bit_connections)} 个位连接，来自 ${edge.port_pairs} 个端口对。`;
+ $('detail').textContent='展开本节后读取所选连线的端口与逐位明细。';
+ if($('port-details').open)void requestDetails();
+}
+$('port-details').addEventListener('toggle',()=>{if($('port-details').open)void requestDetails()});
+$('detail-file').addEventListener('change',async event=>{
+ const file=event.target.files[0];if(!file)return;
+ $('detail').textContent='正在校验完整明细文件…';
+ try{
+  const buffer=await file.arrayBuffer();
+  if(!globalThis.crypto?.subtle)throw Error('当前预览不支持文件校验，请用浏览器打开本图');
+  const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',buffer))).map(b=>b.toString(16).padStart(2,'0')).join('');
+  if(digest!==DATA.flow_json_sha256)throw Error('文件与本图的 flow.json 不一致');
+  detailData=checkDetails(JSON.parse(new TextDecoder().decode(buffer)));displayDetails();
+  if(!selectedEdge)$('detail').textContent='完整明细已载入，请选择一条模块连线。';
+ }catch(error){$('detail').textContent=error.message+'。图形和计数仍可使用。'}
+});
+for(const node of [...MODULES.nodes].sort((a,b)=>a.id.localeCompare(b.id))){const option=document.createElement('option');option.value=node.id;option.textContent=node.id;$('focus').append(option);const element=svgNodes.get(node.id);if(element)element.addEventListener('click',event=>{event.stopPropagation();if(!dragged)selectNode(node.id)})}
+for(const edge of MODULES.edges){const element=svgEdges.get(edge.svg_id);if(element)element.addEventListener('click',event=>{event.stopPropagation();if(!dragged)showConnection(edge)})}
+let moduleTableReady=false;
+$('module-edge-list').addEventListener('toggle',()=>{
+ if(!$('module-edge-list').open||moduleTableReady)return;
+ for(const edge of MODULES.edges){const tr=document.createElement('tr');for(const value of [edge.source,edge.sink,fmt(edge.bit_connections),edge.port_pairs]){const td=document.createElement('td');td.textContent=value;tr.append(td)}tr.addEventListener('click',()=>showConnection(edge));$('module-edges').append(tr)}
+ moduleTableReady=true;
+});
+$('focus').addEventListener('change',()=>selectNode($('focus').value));
+$('fit').addEventListener('click',()=>selectNode(''));
+$('zoom-in').addEventListener('click',()=>zoom(.75));$('zoom-out').addEventListener('click',()=>zoom(1/.75));
+if(diagram){
+diagram.addEventListener('wheel',event=>{event.preventDefault();zoom(event.deltaY<0?.85:1/.85)},{passive:false});
+diagram.addEventListener('pointerdown',event=>{if(event.button!==0)return;dragged=false;const rect=diagram.getBoundingClientRect();pan={x:event.clientX,y:event.clientY,view:[...view],scale:Math.min(rect.width/view[2],rect.height/view[3])}});
+diagram.addEventListener('pointermove',event=>{if(!pan)return;if(!dragged&&Math.hypot(event.clientX-pan.x,event.clientY-pan.y)>4){dragged=true;diagram.setPointerCapture(event.pointerId)}if(!dragged)return;view=[pan.view[0]-(event.clientX-pan.x)/pan.scale,pan.view[1]-(event.clientY-pan.y)/pan.scale,pan.view[2],pan.view[3]];applyView()});
+diagram.addEventListener('pointerup',()=>{pan=null});diagram.addEventListener('pointercancel',()=>{pan=null});
+}
+selectNode('');
+if(!diagram)$('view-status').textContent='当前预览未显示 SVG，可打开下方的 SVG 原图。';
+</script></body></html>

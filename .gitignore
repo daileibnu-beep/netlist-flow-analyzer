@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+build/
+*.working-*/
+*.log
+*.logv
+*.cmd
+*.enc
+*.enc.dat/
